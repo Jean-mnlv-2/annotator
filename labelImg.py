@@ -49,7 +49,7 @@ from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
 from libs.classManagerDialog import ClassManagerDialog
 
-__appname__ = 'labelImg'
+__appname__ = 'AKOUMA Annotator'
 
 
 class WindowMixin(object):
