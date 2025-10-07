@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 import argparse
+import json
 import codecs
 import os.path
 import platform
 import shutil
 import sys
+import time
 import webbrowser as wb
 from functools import partial
 
@@ -45,6 +47,7 @@ from libs.yolo_io import YoloReader
 from libs.yolo_io import TXT_EXT
 from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
+from libs.coco_io import CocoReader
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
 from libs.classManagerDialog import ClassManagerDialog
@@ -72,11 +75,22 @@ class WindowMixin(object):
 
 
 class MainWindow(QMainWindow, WindowMixin):
+    # Async image loading signal (path, QImage)
+    try:
+        imageLoaded = pyqtSignal(str, QImage)
+    except Exception:
+        # PyQt4 compatibility fallback; signal will be connected on the thread object
+        imageLoaded = None
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = list(range(3))
 
     def __init__(self, default_filename=None, default_prefdef_class_file=None, default_save_dir=None):
         super(MainWindow, self).__init__()
         self.setWindowTitle(__appname__)
+        # Enable drag & drop on main window
+        try:
+            self.setAcceptDrops(True)
+        except Exception:
+            pass
 
         # Load setting in the main thread
         self.settings = Settings()
@@ -85,8 +99,9 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.os_name = platform.system()
 
-        # Load string bundle for i18n
-        self.string_bundle = StringBundle.get_bundle()
+        # Load string bundle for i18n (use persisted locale if available)
+        desired_locale = settings.get(SETTING_LOCALE, None)
+        self.string_bundle = StringBundle.get_bundle(desired_locale)
         get_str = lambda str_id: self.string_bundle.get_string(str_id)
 
         # Save as Pascal voc xml
@@ -174,6 +189,11 @@ class MainWindow(QMainWindow, WindowMixin):
         self.file_list_widget.itemDoubleClicked.connect(self.file_item_double_clicked)
         file_list_layout = QVBoxLayout()
         file_list_layout.setContentsMargins(0, 0, 0, 0)
+        # Quick search bar for file list
+        self.file_search = QLineEdit()
+        self.file_search.setPlaceholderText('Rechercher des fichiers...')
+        self.file_search.textChanged.connect(self._filter_files)
+        file_list_layout.addWidget(self.file_search)
         file_list_layout.addWidget(self.file_list_widget)
         # thumbnails in file list
         self.file_list_widget.setIconSize(QSize(64, 64))
@@ -213,6 +233,15 @@ class MainWindow(QMainWindow, WindowMixin):
         self.addDockWidget(Qt.RightDockWidgetArea, self.file_dock)
         self.file_dock.setFeatures(QDockWidget.DockWidgetFloatable)
 
+        # Annotation Preview dock (right side)
+        self.preview_text = QPlainTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setPlaceholderText('Preview des annotations selon le format sélectionné...')
+        self.preview_dock = QDockWidget('Annotation Preview', self)
+        self.preview_dock.setObjectName('preview')
+        self.preview_dock.setWidget(self.preview_text)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.preview_dock)
+
         self.dock_features = QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetFloatable
         self.dock.setFeatures(self.dock.features() ^ self.dock_features)
 
@@ -237,6 +266,9 @@ class MainWindow(QMainWindow, WindowMixin):
                                   None, 'save', 'Export keyboard shortcuts to JSON')
         import_shortcuts = action('Import Shortcuts…', self.import_shortcuts,
                                   None, 'open', 'Import keyboard shortcuts from JSON')
+
+        batch_rename = action('Renommer les images…', self.batch_rename_images,
+                               None, 'edit', 'Renommer toutes les images du dossier courant avec un préfixe et un compteur')
 
         open_annotation = action(get_str('openAnnotation'), self.open_annotation_dialog,
                                  'Ctrl+Shift+O', 'open', get_str('openAnnotationDetail'))
@@ -307,6 +339,13 @@ class MainWindow(QMainWindow, WindowMixin):
         # Dark mode toggle
         dark_mode = action('Dark Mode', self.toggle_dark_mode,
                            'Ctrl+Shift+D', 'expert', 'Toggle dark theme', checkable=True)
+        # Persisted dark mode state
+        dark_enabled = settings.get(SETTING_DARK_MODE, False)
+        dark_mode.setChecked(dark_enabled)
+        if dark_enabled:
+            self.toggle_dark_mode(True)
+        # keep reference for persistence in closeEvent
+        self._dark_mode_action = dark_mode
 
         hide_all = action(get_str('hideAllBox'), partial(self.toggle_polygons, False),
                           'Ctrl+H', 'hide', get_str('hideAllBoxDetail'),
@@ -435,11 +474,52 @@ class MainWindow(QMainWindow, WindowMixin):
         # dynamic class list will be populated later as labels change
         self.filter_menu.addAction('Unverified', lambda: self.apply_filter_menu('unverified'))
         self.filter_menu.addAction('Missing labels', lambda: self.apply_filter_menu('missing'))
+        self.filter_menu.addSeparator()
+        self.filter_menu.addAction('Show only current class', lambda: self._filter_show_current_class())
+        self.filter_menu.addAction('Show all', lambda: self.toggle_polygons(True))
+
+        # File list sorting controls
+        self.sort_menu = QMenu('Sort files', self)
+        self.sort_menu.addAction('Name A→Z', lambda: self._sort_file_list(alpha=True, reverse=False))
+        self.sort_menu.addAction('Name Z→A', lambda: self._sort_file_list(alpha=True, reverse=True))
+        self.sort_menu.addAction('Path depth', lambda: self._sort_file_list(depth=True))
 
         # Auto saving : Enable auto saving if pressing next
         self.auto_saving = QAction(get_str('autoSaveMode'), self)
         self.auto_saving.setCheckable(True)
         self.auto_saving.setChecked(settings.get(SETTING_AUTO_SAVE, False))
+        # Auto-save interval (ms)
+        self._autosave_interval_ms = settings.get('autosave/interval', 0) or 0
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(False)
+        def _autosave_tick():
+            if self.dirty and self.file_path:
+                try:
+                    self.save_file()
+                except Exception:
+                    pass
+        self._autosave_timer.timeout.connect(_autosave_tick)
+        def _toggle_autosave():
+            if self.auto_saving.isChecked() and self._autosave_interval_ms > 0:
+                self._autosave_timer.start(self._autosave_interval_ms)
+            else:
+                self._autosave_timer.stop()
+        self.auto_saving.toggled.connect(_toggle_autosave)
+
+        # Menu to set autosave interval
+        self.autosave_menu = QMenu('Auto-save interval', self)
+        def _set_interval(ms):
+            self._autosave_interval_ms = ms
+            self.settings['autosave/interval'] = ms
+            self.settings.save()
+            if self.auto_saving.isChecked() and ms > 0:
+                self._autosave_timer.start(ms)
+            else:
+                self._autosave_timer.stop()
+        self.autosave_menu.addAction('Off', lambda: _set_interval(0))
+        self.autosave_menu.addAction('5s', lambda: _set_interval(5000))
+        self.autosave_menu.addAction('15s', lambda: _set_interval(15000))
+        self.autosave_menu.addAction('60s', lambda: _set_interval(60000))
         # Sync single class mode from PR#106
         self.single_class_mode = QAction(get_str('singleClsMode'), self)
         self.single_class_mode.setShortcut("Ctrl+Shift+S")
@@ -454,14 +534,27 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, manage_classes, export_shortcuts, import_shortcuts, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, batch_rename, manage_classes, export_shortcuts, import_shortcuts, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut))
+        # Language submenu (FR/EN)
+        self.language_menu = QMenu('Language', self)
+        self._current_locale = settings.get(SETTING_LOCALE, None)
+        def _switch_lang(locale_code):
+            self._current_locale = locale_code
+            QMessageBox.information(self, 'Language', 'La langue sera appliquée au redémarrage.')
+
+        self.language_menu.addAction('Français', lambda: _switch_lang('fr'))
+        self.language_menu.addAction('English', lambda: _switch_lang('en'))
+
         add_actions(self.menus.view, (
             self.auto_saving,
+            self.autosave_menu,
             self.single_class_mode,
             self.display_label_option,
             dark_mode,
+            self.language_menu,
             self.filter_menu,
+            self.sort_menu,
             labels, advanced_mode, None,
             hide_all, show_all, None,
             zoom_in, zoom_out, zoom_org, None,
@@ -494,6 +587,24 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.shortcuts_dock = QDockWidget('Shortcuts', self)
         self.shortcuts_dock.setWidget(shortcuts_text)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.shortcuts_dock)
+        # Style the left shortcuts dock with a green theme
+        try:
+            self.shortcuts_dock.setObjectName('ShortcutsDock')
+            self.shortcuts_dock.setStyleSheet(
+                "QDockWidget#ShortcutsDock::title {"
+                "  background: #198754;"  # Bootstrap green
+                "  color: #ffffff;"
+                "  padding-left: 6px;"
+                "  padding-top: 2px;"
+                "  padding-bottom: 2px;"
+                "}"
+                "QDockWidget#ShortcutsDock {"
+                "  background: #d1e7dd;"  # light green background
+                "  border: 0;"
+                "}"
+            )
+        except Exception:
+            pass
 
         # Command Palette (minimal)
         self.command_palette = QLineEdit(self)
@@ -503,6 +614,26 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.command_palette_dock = None
 
         self.tools = self.toolbar('Tools')
+        # Green-themed left toolbar design
+        try:
+            self.tools.setIconSize(QSize(28, 28))
+            self.tools.setStyleSheet(
+                "QToolBar#ToolsToolBar {"
+                "  background: #198754;"
+                "  border: none;"
+                "  padding: 6px;"
+                "  spacing: 8px;"
+                "}"
+                "QToolBar#ToolsToolBar QToolButton {"
+                "  color: #ffffff;"
+                "}"
+                "QToolBar#ToolsToolBar QToolButton:hover {"
+                "  background: rgba(255,255,255,0.10);"
+                "  border-radius: 4px;"
+                "}"
+            )
+        except Exception:
+            pass
         self.actions.beginner = (
             open, open_dir, change_save_dir, open_next_image, open_prev_image, verify, save, save_format, None, create, copy, delete, None,
             zoom_in, zoom, zoom_out, fit_window, fit_width, None,
@@ -516,12 +647,22 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.statusBar().showMessage('%s started.' % __appname__)
         self.statusBar().show()
 
+        # Onboarding (first launch)
+        if not settings.get(SETTING_ONBOARDING_SHOWN, False):
+            QMessageBox.information(self, 'Bienvenue / Welcome',
+                                    'Astuce: Utilisez Ctrl+U pour ouvrir un dossier, W pour créer une boîte, E pour éditer un label.\nShortcuts: Ctrl+S pour sauvegarder, A/D pour image précédente/suivante.\nVous pouvez changer la langue dans View > Language.')
+            settings[SETTING_ONBOARDING_SHOWN] = True
+            settings.save()
+
         # Application state.
         self.image = QImage()
         self.file_path = ustr(default_filename)
         self.last_open_dir = None
         self.recent_files = []
         self.max_recent = 7
+        # Background image loader handle
+        self._image_loader = None
+        self._loading_path = None
         self.line_color = None
         self.fill_color = None
         self.zoom_level = 100
@@ -570,6 +711,8 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self._history = []
         self._redo = []
         self._history_debounce = False
+        # Recently used labels (for numeric shortcuts 1-9)
+        self._recent_labels = []
 
         def xbool(x):
             if isinstance(x, QVariant):
@@ -615,6 +758,22 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             self.canvas.set_drawing_shape_to_square(True)
         if event.key() == Qt.Key_P and (event.modifiers() & Qt.ControlModifier):
             self.toggle_command_palette()
+        # Numeric shortcuts 1-9 to apply recent labels
+        if Qt.Key_1 <= event.key() <= Qt.Key_9:
+            idx = event.key() - Qt.Key_1
+            if 0 <= idx < len(self._recent_labels):
+                label_text = self._recent_labels[idx]
+                # apply label to selected shape or start new shape with default
+                if self.canvas.selected_shape is not None and self.canvas.editing():
+                    item = self.shapes_to_items.get(self.canvas.selected_shape)
+                    if item is not None:
+                        item.setText(label_text)
+                        item.setBackground(generate_color_by_text(label_text))
+                        self.label_item_changed(item)
+                else:
+                    # set default label and trigger create
+                    self.prev_label_text = label_text
+                    self.create_shape()
 
     # Support Functions #
     def set_format(self, save_format):
@@ -654,6 +813,7 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         else:
             raise ValueError('Unknown label file format.')
         self.set_dirty()
+        self.update_annotation_preview()
 
     def no_shapes(self):
         return not self.items_to_shapes
@@ -696,11 +856,13 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.dirty = True
         self.actions.save.setEnabled(True)
         self._push_history_snapshot()
+        self.update_annotation_preview()
 
     def set_clean(self):
         self.dirty = False
         self.actions.save.setEnabled(False)
         self.actions.create.setEnabled(True)
+        self.update_annotation_preview()
 
     def toggle_actions(self, value=True):
         """Enable/Disable widgets which depend on an opened image."""
@@ -901,6 +1063,15 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         for action in self.actions.onShapesPresent:
             action.setEnabled(True)
         self.update_combo_box()
+        # maintain recent labels list (most-recent-first, unique, cap to 9)
+        if shape.label:
+            try:
+                self._recent_labels.remove(shape.label)
+            except ValueError:
+                pass
+            self._recent_labels.insert(0, shape.label)
+            if len(self._recent_labels) > 9:
+                self._recent_labels = self._recent_labels[:9]
 
     def remove_label(self, shape):
         if shape is None:
@@ -941,6 +1112,7 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             self.add_label(shape)
         self.update_combo_box()
         self.canvas.load_shapes(s)
+        self.update_annotation_preview()
 
     def update_combo_box(self):
         # Get the unique labels and add them to the Combobox.
@@ -985,6 +1157,38 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         else:
             self.filter_by_class(which)
 
+    def _filter_show_current_class(self):
+        text = self.combo_box.cb.currentText()
+        self.filter_by_class(text)
+
+    def _sort_file_list(self, alpha=False, reverse=False, depth=False):
+        if not self.m_img_list:
+            return
+        if alpha:
+            self.m_img_list.sort(key=lambda p: os.path.basename(p).lower(), reverse=reverse)
+        elif depth:
+            self.m_img_list.sort(key=lambda p: p.count(os.sep))
+        # repopulate widget
+        self.file_list_widget.clear()
+        for imgPath in self.m_img_list:
+            item = QListWidgetItem(imgPath)
+            icon = self._thumb_cache.get(imgPath)
+            if icon:
+                item.setIcon(icon)
+            self.file_list_widget.addItem(item)
+
+    def _filter_files(self, text):
+        text = text.strip().lower()
+        self.file_list_widget.clear()
+        for imgPath in self.m_img_list:
+            base = os.path.basename(imgPath).lower()
+            if not text or text in base:
+                item = QListWidgetItem(imgPath)
+                icon = self._thumb_cache.get(imgPath)
+                if icon:
+                    item.setIcon(icon)
+                self.file_list_widget.addItem(item)
+
     def save_labels(self, annotation_file_path):
         annotation_file_path = ustr(annotation_file_path)
         if self.label_file is None:
@@ -1026,6 +1230,8 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
                 self.label_file.save(annotation_file_path, shapes, self.file_path, self.image_data,
                                      self.line_color.getRgb(), self.fill_color.getRgb())
             print('Image:{0} -> Annotation:{1}'.format(self.file_path, annotation_file_path))
+            # Refresh preview after save
+            self.update_annotation_preview()
             return True
         except LabelFileError as e:
             self.error_message(u'Error saving label data', u'<b>%s</b>' % e)
@@ -1311,8 +1517,9 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             elif os.path.isfile(txt_path):
                 self.load_yolo_txt_by_filename(txt_path)
             elif os.path.isfile(json_path):
-                # Could be CreateML or COCO; fallback to CreateML reader for now
-                self.load_create_ml_json_by_filename(json_path, file_path)
+                # Try COCO first, fallback to CreateML
+                if not self.load_coco_json_by_filename(json_path):
+                    self.load_create_ml_json_by_filename(json_path, file_path)
 
         else:
             xml_path = os.path.splitext(file_path)[0] + XML_EXT
@@ -1324,7 +1531,8 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             elif os.path.isfile(txt_path):
                 self.load_yolo_txt_by_filename(txt_path)
             elif os.path.isfile(json_path):
-                self.load_create_ml_json_by_filename(json_path, file_path)
+                if not self.load_coco_json_by_filename(json_path):
+                    self.load_create_ml_json_by_filename(json_path, file_path)
             
 
     def resizeEvent(self, event):
@@ -1340,6 +1548,7 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.canvas.label_font_size = int(0.02 * max(self.image.width(), self.image.height()))
         self.canvas.adjustSize()
         self.canvas.update()
+        # Also update preview when repainting (e.g., zoom/light changes don't alter shapes, so skip heavy work)
 
     # --- Undo/Redo ---
     def _snapshot_shapes(self):
@@ -1432,6 +1641,7 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
 
     def on_shape_moved(self):
         self.set_dirty()
+        self.update_annotation_preview()
 
     def toggle_command_palette(self):
         if self.command_palette.isVisible():
@@ -1508,6 +1718,7 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         settings[SETTING_FILL_COLOR] = self.fill_color
         settings[SETTING_RECENT_FILES] = self.recent_files
         settings[SETTING_ADVANCE_MODE] = not self._beginner
+        settings[SETTING_DARK_MODE] = bool(getattr(self, '_dark_mode_action', None) and self._dark_mode_action.isChecked())
         if self.default_save_dir and os.path.exists(self.default_save_dir):
             settings[SETTING_SAVE_DIR] = ustr(self.default_save_dir)
         else:
@@ -1523,6 +1734,9 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         settings[SETTING_PAINT_LABEL] = self.display_label_option.isChecked()
         settings[SETTING_DRAW_SQUARE] = self.draw_squares_option.isChecked()
         settings[SETTING_LABEL_FILE_FORMAT] = self.label_file_format
+        # persist locale if user switched it
+        if hasattr(self, '_current_locale') and self._current_locale:
+            settings[SETTING_LOCALE] = self._current_locale
         settings.save()
 
     def load_recent(self, filename):
@@ -1668,16 +1882,134 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.dir_name = dir_path
         self.file_path = None
         self.file_list_widget.clear()
+
+        # Progress dialog during scan and list population
+        progress = QProgressDialog('Import des images...', 'Annuler', 0, 0, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(300)
+        progress.show()
+
+        # Scan
         self.m_img_list = self.scan_all_images(dir_path)
         self.img_count = len(self.m_img_list)
+
+        # Update progress range and populate
+        progress.setLabelText('Chargement des vignettes...')
+        progress.setRange(0, self.img_count if self.img_count > 0 else 1)
+
         self.open_next_image()
-        for imgPath in self.m_img_list:
+        for i, imgPath in enumerate(self.m_img_list):
+            if progress.wasCanceled():
+                break
             item = QListWidgetItem(imgPath)
             # set thumbnail icon if available
             icon = self._thumb_cache.get(imgPath)
             if icon:
                 item.setIcon(icon)
             self.file_list_widget.addItem(item)
+            progress.setValue(i + 1)
+
+        progress.close()
+
+    def batch_rename_images(self):
+        # Ensure a directory is loaded
+        if not self.dir_name or not os.path.isdir(self.dir_name):
+            self.statusBar().showMessage('Ouvrez d\'abord un dossier (Open Dir).')
+            self.statusBar().show()
+            return
+        # Ask base name
+        base, ok = QInputDialog.getText(self, 'Renommer les images', 'Nom de base (ex: cacao):')
+        if not ok or not base.strip():
+            return
+        base = base.strip()
+
+        # Ask starting index
+        total = len(self.m_img_list)
+        start_idx, ok = QInputDialog.getInt(self, 'Index de départ', 'Commencer à:', 1, 0, 10**6, 1)
+        if not ok:
+            return
+        # Ask separator
+        sep, ok = QInputDialog.getText(self, 'Séparateur', 'Séparateur entre le nom et le numéro (ex: _):', text='')
+        if not ok:
+            return
+        # Ask zero padding
+        default_pad = len(str(total))
+        pad, ok = QInputDialog.getInt(self, 'Zéro-padding', 'Nombre de chiffres (ex: %d):' % default_pad, default_pad, 1, 10, 1)
+        if not ok:
+            return
+
+        # Confirm
+        reply = QMessageBox.question(self, 'Confirmer',
+                                     'Renommer %d images avec le préfixe "%s" et un compteur ?' % (total, base),
+                                     QMessageBox.Yes | QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        # Progress
+        progress = QProgressDialog('Renommage des images...', 'Annuler', 0, total, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(300)
+        progress.show()
+
+        # Build extension sets and associated annotation paths
+        new_paths = []
+        for offset, old_path in enumerate(self.m_img_list):
+            if progress.wasCanceled():
+                break
+            dirp = os.path.dirname(old_path)
+            ext = os.path.splitext(old_path)[1]
+            num = start_idx + offset
+            new_name = f"{base}{sep}{str(num).zfill(pad)}{ext}"
+            new_path = os.path.join(dirp, new_name)
+            # If target exists, skip
+            if os.path.exists(new_path):
+                new_paths.append(old_path)
+                progress.setValue(offset + 1)
+                continue
+            # Compute annotation paths (in save dir if configured, else alongside)
+            def anno_candidates(img_path):
+                root = os.path.splitext(img_path)[0]
+                return [root + XML_EXT, root + TXT_EXT, root + JSON_EXT]
+            if self.default_save_dir:
+                old_annos = [os.path.join(self.default_save_dir, os.path.splitext(os.path.basename(old_path))[0] + s) for s in [XML_EXT, TXT_EXT, JSON_EXT]]
+                new_annos = [os.path.join(self.default_save_dir, os.path.splitext(new_name)[0] + s) for s in [XML_EXT, TXT_EXT, JSON_EXT]]
+            else:
+                old_annos = anno_candidates(old_path)
+                new_annos = [os.path.splitext(new_path)[0] + s for s in [XML_EXT, TXT_EXT, JSON_EXT]]
+
+            # Rename file and annotations if they exist
+            try:
+                os.rename(old_path, new_path)
+                for oa, na in zip(old_annos, new_annos):
+                    if os.path.exists(oa):
+                        try:
+                            os.rename(oa, na)
+                        except Exception:
+                            pass
+                new_paths.append(new_path)
+            except Exception as e:
+                new_paths.append(old_path)
+            progress.setValue(offset + 1)
+
+        progress.close()
+        # Update internal list, refresh UI
+        if new_paths:
+            self.m_img_list = new_paths
+            self.img_count = len(self.m_img_list)
+            self.file_list_widget.clear()
+            for imgPath in self.m_img_list:
+                item = QListWidgetItem(imgPath)
+                icon = self._thumb_cache.get(imgPath)
+                if icon:
+                    item.setIcon(icon)
+                self.file_list_widget.addItem(item)
+            # reload current index safely
+            if 0 <= self.cur_img_idx < self.img_count:
+                self.load_file(self.m_img_list[self.cur_img_idx])
+            else:
+                self.cur_img_idx = 0
+                if self.m_img_list:
+                    self.load_file(self.m_img_list[0])
 
     def verify_image(self, _value=False):
         # Proceeding next image without dialog if having any label
@@ -1833,6 +2165,7 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             self.set_clean()
             self.statusBar().showMessage('Saved to  %s' % annotation_file_path)
             self.statusBar().show()
+            self.update_annotation_preview()
 
     def close_file(self, _value=False):
         if not self.may_continue():
@@ -1845,17 +2178,28 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
 
     def delete_image(self):
         delete_path = self.file_path
-        if delete_path is not None:
-            idx = self.cur_img_idx
-            if os.path.exists(delete_path):
+        if not delete_path:
+            return
+        idx = self.cur_img_idx
+        if os.path.exists(delete_path):
+            try:
                 os.remove(delete_path)
-            self.import_dir_images(self.last_open_dir)
-            if self.img_count > 0:
-                self.cur_img_idx = min(idx, self.img_count - 1)
-                filename = self.m_img_list[self.cur_img_idx]
+            except Exception as e:
+                self.statusBar().showMessage('Delete failed: %s' % ustr(e))
+                self.statusBar().show()
+                return
+        # Refresh directory listing and thumbnails
+        self.import_dir_images(self.last_open_dir)
+        n = len(self.m_img_list)
+        if n <= 0:
+            self.close_file()
+            return
+        # Clamp index to valid range
+        self.cur_img_idx = max(0, min(idx, n - 1))
+        if 0 <= self.cur_img_idx < n:
+            filename = self.m_img_list[self.cur_img_idx]
+            if filename:
                 self.load_file(filename)
-            else:
-                self.close_file()
 
     def reset_all(self):
         self.settings.reset()
@@ -1986,6 +2330,19 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         self.load_labels(shapes)
         self.canvas.verified = create_ml_parse_reader.verified
 
+    def load_coco_json_by_filename(self, json_path):
+        try:
+            reader = CocoReader(json_path)
+            shapes = reader.get_shapes()
+            if not shapes:
+                return False
+            self.set_format(FORMAT_COCO)
+            self.load_labels(shapes)
+            self.canvas.verified = False
+            return True
+        except Exception:
+            return False
+
     def copy_previous_bounding_boxes(self):
         current_index = self.m_img_list.index(self.file_path)
         if current_index - 1 >= 0:
@@ -1999,6 +2356,230 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
 
     def toggle_draw_square(self):
         self.canvas.set_drawing_shape_to_square(self.draw_squares_option.isChecked())
+
+    # --- Annotation preview rendering ---
+    def _collect_current_shapes_dict(self):
+        def fmt(s):
+            return dict(
+                label=s.label,
+                line_color=s.line_color.getRgb(),
+                fill_color=s.fill_color.getRgb(),
+                points=[(p.x(), p.y()) for p in s.points],
+                difficult=s.difficult,
+            )
+        return [fmt(s) for s in self.canvas.shapes]
+
+    def update_annotation_preview(self):
+        try:
+            if not hasattr(self, 'preview_text') or self.preview_text is None:
+                return
+            shapes = self._collect_current_shapes_dict()
+            if not self.file_path or not shapes:
+                self.preview_text.setPlainText('')
+                return
+            # Build a preview according to current selected format
+            fmt = self.label_file_format
+            if fmt == LabelFileFormat.PASCAL_VOC:
+                # Build minimal Pascal VOC XML preview
+                from xml.etree.ElementTree import Element, SubElement, tostring
+                top = Element('annotation')
+                folder = SubElement(top, 'folder'); folder.text = os.path.basename(os.path.dirname(self.file_path))
+                filename = SubElement(top, 'filename'); filename.text = os.path.basename(self.file_path)
+                size = SubElement(top, 'size')
+                SubElement(size, 'width').text = str(self.image.width())
+                SubElement(size, 'height').text = str(self.image.height())
+                SubElement(size, 'depth').text = '3'
+                for s in shapes:
+                    obj = SubElement(top, 'object')
+                    SubElement(obj, 'name').text = s['label']
+                    bb = SubElement(obj, 'bndbox')
+                    xs = [p[0] for p in s['points']]; ys = [p[1] for p in s['points']]
+                    SubElement(bb, 'xmin').text = str(int(min(xs)))
+                    SubElement(bb, 'ymin').text = str(int(min(ys)))
+                    SubElement(bb, 'xmax').text = str(int(max(xs)))
+                    SubElement(bb, 'ymax').text = str(int(max(ys)))
+                text = tostring(top, encoding='unicode')
+                self.preview_text.setPlainText(text)
+            elif fmt == LabelFileFormat.YOLO:
+                # YOLO txt preview (multiple lines)
+                lines = []
+                classes = list(self.label_hist)
+                for s in shapes:
+                    xs = [p[0] for p in s['points']]; ys = [p[1] for p in s['points']]
+                    x_min, x_max = min(xs), max(xs)
+                    y_min, y_max = min(ys), max(ys)
+                    x_center = ((x_min + x_max) / 2) / self.image.width()
+                    y_center = ((y_min + y_max) / 2) / self.image.height()
+                    w = (x_max - x_min) / self.image.width()
+                    h = (y_max - y_min) / self.image.height()
+                    if s['label'] not in classes:
+                        classes.append(s['label'])
+                    idx = classes.index(s['label'])
+                    lines.append(f"{idx} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f}")
+                text = '\n'.join(lines)
+                self.preview_text.setPlainText(text)
+            elif fmt == LabelFileFormat.CREATE_ML:
+                # CreateML snippet for current image only
+                anns = []
+                for s in shapes:
+                    xs = [p[0] for p in s['points']]; ys = [p[1] for p in s['points']]
+                    x1, x2 = min(xs), max(xs); y1, y2 = min(ys), max(ys)
+                    width = x2 - x1; height = y2 - y1
+                    x = x1 + width / 2; y = y1 + height / 2
+                    anns.append({
+                        'label': s['label'],
+                        'coordinates': {'x': x, 'y': y, 'width': width, 'height': height}
+                    })
+                data = [{
+                    'image': os.path.basename(self.file_path),
+                    'verified': self.canvas.verified,
+                    'annotations': anns,
+                }]
+                self.preview_text.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+            elif fmt == LabelFileFormat.COCO:
+                # Minimal COCO single-image preview
+                cats = []
+                cat_to_id = {}
+                for lab in self.label_hist:
+                    if lab and lab not in cat_to_id:
+                        cat_to_id[lab] = len(cat_to_id) + 1
+                        cats.append({'id': cat_to_id[lab], 'name': lab, 'supercategory': 'object'})
+                anns = []
+                ann_id = 1
+                for s in shapes:
+                    xs = [p[0] for p in s['points']]; ys = [p[1] for p in s['points']]
+                    x1, x2 = min(xs), max(xs); y1, y2 = min(ys), max(ys)
+                    w = max(0.0, x2 - x1); h = max(0.0, y2 - y1)
+                    cat = cat_to_id.get(s['label']) or cat_to_id.setdefault(s['label'], len(cat_to_id) + 1)
+                    anns.append({'id': ann_id, 'image_id': 1, 'category_id': cat, 'bbox': [x1, y1, w, h], 'area': float(w*h), 'iscrowd': 0, 'segmentation': []})
+                    ann_id += 1
+                data = {
+                    'images': [{'id': 1, 'file_name': os.path.basename(self.file_path), 'width': self.image.width(), 'height': self.image.height()}],
+                    'categories': cats,
+                    'annotations': anns,
+                }
+                self.preview_text.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as e:
+            # Fail silently to avoid interrupting labeling
+            try:
+                self.preview_text.setPlainText('Preview error: ' + ustr(e))
+            except Exception:
+                pass
+
+    # --- Drag & Drop Support ---
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            try:
+                urls = event.mimeData().urls()
+                if urls:
+                    event.acceptProposedAction()
+                    return
+            except Exception:
+                pass
+        event.ignore()
+
+    def dropEvent(self, event):
+        try:
+            paths = []
+            for url in event.mimeData().urls():
+                local = url.toLocalFile()
+                if local:
+                    paths.append(local)
+        except Exception:
+            return
+
+        if not paths:
+            return
+
+        first = paths[0]
+        if os.path.isdir(first):
+            self.open_dir_dialog(dir_path=first, silent=True)
+            return
+
+        # If a file: decide action based on extension
+        ext = os.path.splitext(first)[1].lower()
+        if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tif', '.tiff', '.webp']:
+            self.load_file_async(first)
+            return
+        if ext == XML_EXT:
+            self.load_pascal_xml_by_filename(first)
+            return
+        if ext == TXT_EXT:
+            self.load_yolo_txt_by_filename(first)
+            return
+        if ext == JSON_EXT:
+            # Try CreateML first (current behavior)
+            self.load_create_ml_json_by_filename(first, first)
+            return
+
+    # --- Background image loading ---
+    def load_file_async(self, file_path=None):
+        """Load image data off the UI thread and apply when ready."""
+        if file_path is None:
+            file_path = self.settings.get(SETTING_FILENAME)
+        file_path = ustr(file_path)
+        if not file_path:
+            return False
+
+        # cancel/cleanup previous loader
+        try:
+            if self._image_loader and self._image_loader.isRunning():
+                self._image_loader.terminate()
+        except Exception:
+            pass
+
+        self.reset_state()
+        self.canvas.setEnabled(False)
+        self.status("Loading %s ..." % os.path.basename(file_path))
+
+        class _Loader(QThread):
+            def __init__(self, path):
+                super(_Loader, self).__init__()
+                self.path = path
+                self.result = None
+            def run(self):
+                try:
+                    reader = QImageReader(self.path)
+                    reader.setAutoTransform(True)
+                    img = reader.read()
+                    self.result = img
+                except Exception:
+                    self.result = None
+
+        loader = _Loader(file_path)
+        self._image_loader = loader
+        self._loading_path = file_path
+
+        def _apply():
+            image = loader.result
+            unicode_file_path = os.path.abspath(file_path)
+            if image is None or image.isNull():
+                self.error_message(u'Error opening file', u"<p>Make sure <i>%s</i> is a valid image file." % unicode_file_path)
+                self.status("Error reading %s" % unicode_file_path)
+                return False
+            # mimic synchronous path from load_file after QImage ready
+            self.status("Loaded %s" % os.path.basename(unicode_file_path))
+            self.image = image
+            self.file_path = unicode_file_path
+            self.canvas.load_pixmap(QPixmap.fromImage(image))
+            self.set_clean()
+            self.canvas.setEnabled(True)
+            self.adjust_scale(initial=True)
+            self.paint_canvas()
+            self.add_recent_file(self.file_path)
+            self.toggle_actions(True)
+            self.show_bounding_box_from_annotation_file(self.file_path)
+            counter = self.counter_str()
+            self.setWindowTitle(__appname__ + ' ' + self.file_path + ' ' + counter)
+            if self.label_list.count():
+                self.label_list.setCurrentItem(self.label_list.item(self.label_list.count() - 1))
+                self.label_list.item(self.label_list.count() - 1).setSelected(True)
+            self.canvas.setFocus(True)
+            return True
+
+        loader.finished.connect(_apply)
+        loader.start()
+        return True
 
 def inverted(color):
     return QColor(*[255 - v for v in color.getRgb()])
@@ -2026,6 +2607,38 @@ def get_main_app(argv=None):
     app = QApplication(argv)
     app.setApplicationName(__appname__)
     app.setWindowIcon(new_icon("app"))
+    # Splash screen with green background and title/logo
+    try:
+        width, height = 480, 280
+        splash_pix = QPixmap(width, height)
+        splash_pix.fill(QColor(25, 135, 84))  # Bootstrap green
+        # Paint logo and title
+        painter = QPainter(splash_pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Draw app icon if available
+        icon = new_icon("app").pixmap(96, 96)
+        if not icon.isNull():
+            x = (width - icon.width()) // 2
+            y = (height // 2) - icon.height()
+            painter.drawPixmap(x, y, icon)
+        # Draw title text
+        painter.setPen(Qt.white)
+        font = painter.font()
+        font.setPointSize(18)
+        font.setBold(True)
+        painter.setFont(font)
+        rect = QRect(0, height // 2, width, height // 2)
+        painter.drawText(rect, Qt.AlignHCenter | Qt.AlignVCenter, __appname__)
+        painter.end()
+
+        splash = QSplashScreen(splash_pix)
+        splash.show()
+        app.processEvents()
+
+        # Garde le splash visible pendant 8 secondes
+        QTimer.singleShot(8000, splash.close)
+    except Exception:
+        splash = None
     # Tzutalin 201705+: Accept extra agruments to change predefined class file
     argparser = argparse.ArgumentParser()
     argparser.add_argument("image_dir", nargs="?")
@@ -2044,6 +2657,11 @@ def get_main_app(argv=None):
                      args.class_file,
                      args.save_dir)
     win.show()
+    try:
+        if splash:
+            splash.finish(win)
+    except Exception:
+        pass
     return app, win
 
 

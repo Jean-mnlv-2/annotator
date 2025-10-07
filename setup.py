@@ -8,7 +8,7 @@ import sys
 import os
 
 here = os.path.abspath(os.path.dirname(__file__))
-NAME = 'labelImg'
+NAME = 'AKOUMA Annotator'
 REQUIRES_PYTHON = '>=3.0.0'
 REQUIRED_DEP = ['pyqt5', 'lxml']
 about = {}

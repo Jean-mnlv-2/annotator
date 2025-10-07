@@ -45,6 +45,7 @@ class YOLOWriter:
 
         # PR387
         box_name = box['name']
+        # Ensure deterministic class ordering: keep original order but avoid duplicates
         if box_name not in class_list:
             class_list.append(box_name)
 
@@ -72,6 +73,7 @@ class YOLOWriter:
                 class_index, x_center, y_center, w, h = self.bnd_box_to_yolo_line(box, class_list)
                 out_file.write("%d %.6f %.6f %.6f %.6f\n" % (class_index, x_center, y_center, w, h))
 
+            # Persist classes in the given order for YOLOv5/8 compatibility
             for c in class_list:
                 out_class_file.write(c + '\n')
         except OSError as e:
@@ -107,13 +109,12 @@ class YoloReader:
         else:
             self.class_list_path = class_list_path
 
-        if not os.path.exists(self.class_list_path):
-            raise FileNotFoundError(f'YOLO classes file not found: {self.class_list_path}')
-        with codecs.open(self.class_list_path, 'r', encoding=ENCODE_METHOD) as classes_file:
-            content = classes_file.read().strip('\n')
-            self.classes = content.split('\n') if content else []
-        if not self.classes:
-            raise ValueError('YOLO classes list is empty')
+        # If classes.txt missing, fallback to an empty list; will attempt to infer labels if possible
+        self.classes = []
+        if os.path.exists(self.class_list_path):
+            with codecs.open(self.class_list_path, 'r', encoding=ENCODE_METHOD) as classes_file:
+                content = classes_file.read().strip('\n')
+                self.classes = content.split('\n') if content else []
 
         # print (self.classes)
 
@@ -123,10 +124,7 @@ class YoloReader:
         self.img_size = img_size
 
         self.verified = False
-        # try:
         self.parse_yolo_format()
-        # except:
-        #     pass
 
     def get_shapes(self) -> list:
         return self.shapes
@@ -137,7 +135,15 @@ class YoloReader:
         self.shapes.append((label, points, None, None, difficult))
 
     def yolo_line_to_shape(self, class_index: str, x_center: str, y_center: str, w: str, h: str) -> Tuple[str, int, int, int, int]:
-        label = self.classes[int(class_index)]
+        # Handle missing/short classes by synthesizing labels like class_0
+        idx = int(float(class_index))
+        if idx < 0:
+            idx = 0
+        if idx >= len(self.classes):
+            # Fill up to idx
+            while len(self.classes) <= idx:
+                self.classes.append(f'class_{len(self.classes)}')
+        label = self.classes[idx]
 
         x_min = max(float(x_center) - float(w) / 2, 0)
         x_max = min(float(x_center) + float(w) / 2, 1)
@@ -157,7 +163,8 @@ class YoloReader:
                 line = raw.strip()
                 if not line or line.startswith('#'):
                     continue
-                parts = line.split(' ')
+                # Support both space and multiple-space/tab separators
+                parts = line.split()
                 if len(parts) != 5:
                     # Skip malformed lines gracefully
                     continue
