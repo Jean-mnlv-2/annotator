@@ -13,12 +13,14 @@ from libs.create_ml_io import CreateMLWriter
 from libs.pascal_voc_io import PascalVocWriter
 from libs.pascal_voc_io import XML_EXT
 from libs.yolo_io import YOLOWriter
+from libs.coco_io import CocoWriter
 
 
 class LabelFileFormat(Enum):
     PASCAL_VOC = 1
     YOLO = 2
     CREATE_ML = 3
+    COCO = 4
 
 
 class LabelFileError(Exception):
@@ -79,6 +81,19 @@ class LabelFile(object):
             writer.add_bnd_box(bnd_box[0], bnd_box[1], bnd_box[2], bnd_box[3], label, difficult)
 
         writer.save(target_file=filename)
+        return
+
+    def save_coco_format(self, filename, shapes, image_path, image_data, class_list,
+                         line_color=None, fill_color=None, database_src=None):
+        img_file_name = os.path.basename(image_path)
+        if isinstance(image_data, QImage):
+            image = image_data
+        else:
+            image = QImage()
+            image.load(image_path)
+        image_shape = [image.height(), image.width(), 1 if image.isGrayscale() else 3]
+        writer = CocoWriter(img_file_name, image_shape, class_list)
+        writer.save(filename, shapes)
         return
 
     def save_yolo_format(self, filename, shapes, image_path, image_data, class_list,

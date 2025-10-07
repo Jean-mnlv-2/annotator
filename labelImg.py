@@ -47,6 +47,7 @@ from libs.create_ml_io import CreateMLReader
 from libs.create_ml_io import JSON_EXT
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
+from libs.classManagerDialog import ClassManagerDialog
 
 __appname__ = 'labelImg'
 
@@ -174,6 +175,9 @@ class MainWindow(QMainWindow, WindowMixin):
         file_list_layout = QVBoxLayout()
         file_list_layout.setContentsMargins(0, 0, 0, 0)
         file_list_layout.addWidget(self.file_list_widget)
+        # thumbnails in file list
+        self.file_list_widget.setIconSize(QSize(64, 64))
+        self.file_list_widget.setUniformItemSizes(True)
         file_list_container = QWidget()
         file_list_container.setLayout(file_list_layout)
         self.file_dock = QDockWidget(get_str('fileList'), self)
@@ -200,7 +204,7 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.scrollRequest.connect(self.scroll_request)
 
         self.canvas.newShape.connect(self.new_shape)
-        self.canvas.shapeMoved.connect(self.set_dirty)
+        self.canvas.shapeMoved.connect(self.on_shape_moved)
         self.canvas.selectionChanged.connect(self.shape_selection_changed)
         self.canvas.drawingPolygon.connect(self.toggle_drawing_sensitive)
 
@@ -225,6 +229,14 @@ class MainWindow(QMainWindow, WindowMixin):
 
         change_save_dir = action(get_str('changeSaveDir'), self.change_save_dir_dialog,
                                  'Ctrl+r', 'open', get_str('changeSavedAnnotationDir'))
+
+        manage_classes = action('Manage Classes', self.open_class_manager,
+                                 None, 'labels', 'Edit class list')
+
+        export_shortcuts = action('Export Shortcuts…', self.export_shortcuts,
+                                  None, 'save', 'Export keyboard shortcuts to JSON')
+        import_shortcuts = action('Import Shortcuts…', self.import_shortcuts,
+                                  None, 'open', 'Import keyboard shortcuts from JSON')
 
         open_annotation = action(get_str('openAnnotation'), self.open_annotation_dialog,
                                  'Ctrl+Shift+O', 'open', get_str('openAnnotationDetail'))
@@ -252,6 +264,8 @@ class MainWindow(QMainWindow, WindowMixin):
                 return '&YOLO', 'format_yolo'
             elif format == LabelFileFormat.CREATE_ML:
                 return '&CreateML', 'format_createml'
+            elif format == LabelFileFormat.COCO:
+                return '&COCO', 'format_voc'
 
         save_format = action(get_format_meta(self.label_file_format)[0],
                              self.change_format, 'Ctrl+Y',
@@ -283,9 +297,16 @@ class MainWindow(QMainWindow, WindowMixin):
                       'Ctrl+D', 'copy', get_str('dupBoxDetail'),
                       enabled=False)
 
+        undo_act = action('Undo', self.undo_action, 'Ctrl+Z', 'undo', 'Undo last action', enabled=False)
+        redo_act = action('Redo', self.redo_action, 'Ctrl+Shift+Z', 'undo', 'Redo last undone action', enabled=False)
+
         advanced_mode = action(get_str('advancedMode'), self.toggle_advanced_mode,
                                'Ctrl+Shift+A', 'expert', get_str('advancedModeDetail'),
                                checkable=True)
+
+        # Dark mode toggle
+        dark_mode = action('Dark Mode', self.toggle_dark_mode,
+                           'Ctrl+Shift+D', 'expert', 'Toggle dark theme', checkable=True)
 
         hide_all = action(get_str('hideAllBox'), partial(self.toggle_polygons, False),
                           'Ctrl+H', 'hide', get_str('hideAllBoxDetail'),
@@ -409,6 +430,12 @@ class MainWindow(QMainWindow, WindowMixin):
             recentFiles=QMenu(get_str('menu_openRecent')),
             labelList=label_menu)
 
+        # Simple filters menu under View
+        self.filter_menu = QMenu('Filters', self)
+        # dynamic class list will be populated later as labels change
+        self.filter_menu.addAction('Unverified', lambda: self.apply_filter_menu('unverified'))
+        self.filter_menu.addAction('Missing labels', lambda: self.apply_filter_menu('missing'))
+
         # Auto saving : Enable auto saving if pressing next
         self.auto_saving = QAction(get_str('autoSaveMode'), self)
         self.auto_saving.setCheckable(True)
@@ -427,17 +454,28 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, manage_classes, export_shortcuts, import_shortcuts, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut))
         add_actions(self.menus.view, (
             self.auto_saving,
             self.single_class_mode,
             self.display_label_option,
+            dark_mode,
+            self.filter_menu,
             labels, advanced_mode, None,
             hide_all, show_all, None,
             zoom_in, zoom_out, zoom_org, None,
             fit_window, fit_width, None,
             light_brighten, light_darken, light_org))
+
+        add_actions(self.menus.edit, (undo_act, redo_act, None))
+
+        self.actions.undo = undo_act
+        self.actions.redo = redo_act
+
+        # Toggle Command Palette with Ctrl+P
+        toggle_palette = action('Command Palette', self.toggle_command_palette, 'Ctrl+P', 'help', 'Open command palette')
+        add_actions(self.menus.help, (toggle_palette,))
 
         self.menus.file.aboutToShow.connect(self.update_file_menu)
 
@@ -446,6 +484,23 @@ class MainWindow(QMainWindow, WindowMixin):
         add_actions(self.canvas.menus[1], (
             action('&Copy here', self.copy_shape),
             action('&Move here', self.move_shape)))
+
+        # Shortcuts dock
+        shortcuts_text = QPlainTextEdit()
+        shortcuts_text.setReadOnly(True)
+        shortcuts_text.setPlainText('''
+Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW       Create Rect\nA/D     Prev/Next Image\nDel     Delete Box\nSpace   Verify Image\nCtrl++  Zoom In\nCtrl+-  Zoom Out
+''')
+        self.shortcuts_dock = QDockWidget('Shortcuts', self)
+        self.shortcuts_dock.setWidget(shortcuts_text)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.shortcuts_dock)
+
+        # Command Palette (minimal)
+        self.command_palette = QLineEdit(self)
+        self.command_palette.setPlaceholderText('Type to search commands... (Press Enter)')
+        self.command_palette.returnPressed.connect(self._exec_command_palette)
+        self.command_palette.hide()
+        self.command_palette_dock = None
 
         self.tools = self.toolbar('Tools')
         self.actions.beginner = (
@@ -507,6 +562,15 @@ class MainWindow(QMainWindow, WindowMixin):
         # Add chris
         Shape.difficult = self.difficult
 
+        # simple thumbnail cache and preloader
+        self._thumb_cache = {}
+        self._next_image_cache = None
+
+        # Undo/Redo history (snapshots of shapes)
+        self._history = []
+        self._redo = []
+        self._history_debounce = False
+
         def xbool(x):
             if isinstance(x, QVariant):
                 return x.toBool()
@@ -542,11 +606,15 @@ class MainWindow(QMainWindow, WindowMixin):
     def keyReleaseEvent(self, event):
         if event.key() == Qt.Key_Control:
             self.canvas.set_drawing_shape_to_square(False)
+        if event.key() == Qt.Key_Escape and self.command_palette.isVisible():
+            self.command_palette.hide()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Control:
             # Draw rectangle if Ctrl is pressed
             self.canvas.set_drawing_shape_to_square(True)
+        if event.key() == Qt.Key_P and (event.modifiers() & Qt.ControlModifier):
+            self.toggle_command_palette()
 
     # Support Functions #
     def set_format(self, save_format):
@@ -568,12 +636,20 @@ class MainWindow(QMainWindow, WindowMixin):
             self.label_file_format = LabelFileFormat.CREATE_ML
             LabelFile.suffix = JSON_EXT
 
+        elif save_format == FORMAT_COCO:
+            self.actions.save_format.setText(FORMAT_COCO)
+            self.actions.save_format.setIcon(new_icon("format_voc"))
+            self.label_file_format = LabelFileFormat.COCO
+            LabelFile.suffix = JSON_EXT
+
     def change_format(self):
         if self.label_file_format == LabelFileFormat.PASCAL_VOC:
             self.set_format(FORMAT_YOLO)
         elif self.label_file_format == LabelFileFormat.YOLO:
             self.set_format(FORMAT_CREATEML)
         elif self.label_file_format == LabelFileFormat.CREATE_ML:
+            self.set_format(FORMAT_COCO)
+        elif self.label_file_format == LabelFileFormat.COCO:
             self.set_format(FORMAT_PASCALVOC)
         else:
             raise ValueError('Unknown label file format.')
@@ -619,6 +695,7 @@ class MainWindow(QMainWindow, WindowMixin):
     def set_dirty(self):
         self.dirty = True
         self.actions.save.setEnabled(True)
+        self._push_history_snapshot()
 
     def set_clean(self):
         self.dirty = False
@@ -876,6 +953,38 @@ class MainWindow(QMainWindow, WindowMixin):
 
         self.combo_box.update_items(unique_text_list)
 
+    # --- Filters ---
+    def filter_by_class(self, class_name):
+        for i in range(self.label_list.count()):
+            item = self.label_list.item(i)
+            if not class_name or item.text() == class_name:
+                item.setCheckState(Qt.Checked)
+            else:
+                item.setCheckState(Qt.Unchecked)
+
+    def filter_unverified(self):
+        # Show only if canvas.verified is False
+        if self.canvas.verified:
+            return
+        for i in range(self.label_list.count()):
+            item = self.label_list.item(i)
+            item.setCheckState(Qt.Checked)
+
+    def filter_missing_labels(self):
+        # Hide items with empty label
+        for i in range(self.label_list.count()):
+            item = self.label_list.item(i)
+            if not item.text().strip():
+                item.setCheckState(Qt.Unchecked)
+
+    def apply_filter_menu(self, which):
+        if which == 'unverified':
+            self.filter_unverified()
+        elif which == 'missing':
+            self.filter_missing_labels()
+        else:
+            self.filter_by_class(which)
+
     def save_labels(self, annotation_file_path):
         annotation_file_path = ustr(annotation_file_path)
         if self.label_file is None:
@@ -908,6 +1017,11 @@ class MainWindow(QMainWindow, WindowMixin):
                     annotation_file_path += JSON_EXT
                 self.label_file.save_create_ml_format(annotation_file_path, shapes, self.file_path, self.image_data,
                                                       self.label_hist, self.line_color.getRgb(), self.fill_color.getRgb())
+            elif self.label_file_format == LabelFileFormat.COCO:
+                if annotation_file_path[-5:].lower() != ".json":
+                    annotation_file_path += JSON_EXT
+                self.label_file.save_coco_format(annotation_file_path, shapes, self.file_path, self.image_data,
+                                                 self.label_hist, self.line_color.getRgb(), self.fill_color.getRgb())
             else:
                 self.label_file.save(annotation_file_path, shapes, self.file_path, self.image_data,
                                      self.line_color.getRgb(), self.fill_color.getRgb())
@@ -931,6 +1045,11 @@ class MainWindow(QMainWindow, WindowMixin):
                 self.label_list.item(i).setCheckState(0)
             else:
                 self.label_list.item(i).setCheckState(2)
+        # also apply filter by class to canvas visibility
+        if text == "":
+            self.toggle_polygons(True)
+        else:
+            self.filter_by_class(text)
 
     def default_label_combo_selection_changed(self, index):
         self.default_label=self.label_hist[index]
@@ -1192,6 +1311,7 @@ class MainWindow(QMainWindow, WindowMixin):
             elif os.path.isfile(txt_path):
                 self.load_yolo_txt_by_filename(txt_path)
             elif os.path.isfile(json_path):
+                # Could be CreateML or COCO; fallback to CreateML reader for now
                 self.load_create_ml_json_by_filename(json_path, file_path)
 
         else:
@@ -1220,6 +1340,135 @@ class MainWindow(QMainWindow, WindowMixin):
         self.canvas.label_font_size = int(0.02 * max(self.image.width(), self.image.height()))
         self.canvas.adjustSize()
         self.canvas.update()
+
+    # --- Undo/Redo ---
+    def _snapshot_shapes(self):
+        return [
+            dict(
+                label=s.label,
+                line_color=s.line_color.getRgb(),
+                fill_color=s.fill_color.getRgb(),
+                points=[(p.x(), p.y()) for p in s.points],
+                difficult=s.difficult,
+            )
+            for s in self.canvas.shapes
+        ]
+
+    def _apply_snapshot(self, snapshot):
+        # Clear and load shapes
+        self.items_to_shapes.clear()
+        self.shapes_to_items.clear()
+        self.label_list.clear()
+        self.canvas.load_shapes([])
+        self.load_labels([
+            (
+                shape['label'],
+                shape['points'],
+                shape.get('line_color'),
+                shape.get('fill_color'),
+                shape.get('difficult', False),
+            )
+            for shape in snapshot
+        ])
+        self.set_dirty()
+
+    def _update_undo_redo_actions(self):
+        self.actions.undo.setEnabled(len(self._history) > 0)
+        self.actions.redo.setEnabled(len(self._redo) > 0)
+
+    def _push_history_snapshot(self):
+        if self._history_debounce:
+            return
+        self._history_debounce = True
+        try:
+            snap = self._snapshot_shapes()
+            self._history.append(snap)
+            self._redo.clear()
+            self._update_undo_redo_actions()
+        finally:
+            QTimer.singleShot(50, lambda: setattr(self, '_history_debounce', False))
+
+    def undo_action(self):
+        if not self._history:
+            return
+        current = self._snapshot_shapes()
+        last = self._history.pop()
+        self._redo.append(current)
+        self._apply_snapshot(last)
+        self._update_undo_redo_actions()
+
+    def redo_action(self):
+        if not self._redo:
+            return
+        current = self._snapshot_shapes()
+        nxt = self._redo.pop()
+        self._history.append(current)
+        self._apply_snapshot(nxt)
+        self._update_undo_redo_actions()
+
+    def toggle_dark_mode(self, value=True):
+        # Very simple Fusion dark palette
+        app = QApplication.instance()
+        if not app:
+            return
+        if value:
+            app.setStyle('Fusion')
+            palette = QPalette()
+            palette.setColor(QPalette.Window, QColor(53, 53, 53))
+            palette.setColor(QPalette.WindowText, Qt.white)
+            palette.setColor(QPalette.Base, QColor(35, 35, 35))
+            palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+            palette.setColor(QPalette.ToolTipBase, Qt.white)
+            palette.setColor(QPalette.ToolTipText, Qt.white)
+            palette.setColor(QPalette.Text, Qt.white)
+            palette.setColor(QPalette.Button, QColor(53, 53, 53))
+            palette.setColor(QPalette.ButtonText, Qt.white)
+            palette.setColor(QPalette.BrightText, Qt.red)
+            palette.setColor(QPalette.Highlight, QColor(142, 45, 197).lighter())
+            palette.setColor(QPalette.HighlightedText, Qt.black)
+            app.setPalette(palette)
+        else:
+            app.setPalette(QPalette())
+
+    def on_shape_moved(self):
+        self.set_dirty()
+
+    def toggle_command_palette(self):
+        if self.command_palette.isVisible():
+            self.command_palette.hide()
+            if self.command_palette_dock:
+                self.command_palette_dock.hide()
+            return
+        if not self.command_palette_dock:
+            self.command_palette_dock = QDockWidget('Command Palette', self)
+            w = QWidget()
+            lay = QVBoxLayout(w)
+            lay.setContentsMargins(6, 6, 6, 6)
+            lay.addWidget(self.command_palette)
+            self.command_palette_dock.setWidget(w)
+            self.addDockWidget(Qt.TopDockWidgetArea, self.command_palette_dock)
+        self.command_palette_dock.show()
+        self.command_palette.show()
+        self.command_palette.setFocus()
+
+    def _exec_command_palette(self):
+        query = self.command_palette.text().strip().lower()
+        if not query:
+            return
+        commands = {
+            'open': self.open_file,
+            'open dir': self.open_dir_dialog,
+            'save': self.save_file,
+            'next': self.open_next_image,
+            'prev': self.open_prev_image,
+            'verify': self.verify_image,
+            'dark': lambda: self.toggle_dark_mode(True),
+            'light': lambda: self.toggle_dark_mode(False),
+        }
+        for key, fn in commands.items():
+            if key in query:
+                fn()
+                break
 
     def adjust_scale(self, initial=False):
         value = self.scalers[self.FIT_WINDOW if initial else self.zoom_mode]()
@@ -1290,6 +1539,14 @@ class MainWindow(QMainWindow, WindowMixin):
                     relative_path = os.path.join(root, file)
                     path = ustr(os.path.abspath(relative_path))
                     images.append(path)
+                    # build thumbnail icons lazily
+                    try:
+                        if path not in self._thumb_cache:
+                            pix = QPixmap(path)
+                            if not pix.isNull():
+                                self._thumb_cache[path] = QIcon(pix.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                    except Exception:
+                        pass
         natural_sort(images, key=lambda x: x.lower())
         return images
 
@@ -1339,6 +1596,48 @@ class MainWindow(QMainWindow, WindowMixin):
 
             self.load_create_ml_json_by_filename(filename, self.file_path)         
         
+    def open_class_manager(self, _value=False):
+        dlg = ClassManagerDialog(self.label_hist, parent=self)
+        if dlg.exec_():
+            self.label_hist = dlg.get_classes()
+            # refresh default label combo and filter combo
+            self.default_label_combo_box.items = self.label_hist
+            self.default_label_combo_box.cb.clear()
+            self.default_label_combo_box.cb.addItems(self.label_hist)
+            self.update_combo_box()
+
+    def export_shortcuts(self):
+        path, _ = QFileDialog.getSaveFileName(self, 'Export Shortcuts', self.current_path(), 'JSON (*.json)')
+        if not path:
+            return
+        data = {
+            'save': 'Ctrl+S',
+            'open': 'Ctrl+O',
+            'open_dir': 'Ctrl+U',
+            'undo': 'Ctrl+Z',
+            'redo': 'Ctrl+Shift+Z',
+            'palette': 'Ctrl+P',
+        }
+        try:
+            import json
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.error_message('Export Shortcuts', ustr(e))
+
+    def import_shortcuts(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Import Shortcuts', self.current_path(), 'JSON (*.json)')
+        if not path:
+            return
+        try:
+            import json
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Placeholder: store metadata for future full remapping
+            self.settings['custom_shortcuts'] = data
+            self.statusBar().showMessage('Shortcuts imported. Some changes may require restart.', 5000)
+        except Exception as e:
+            self.error_message('Import Shortcuts', ustr(e))
 
     def open_dir_dialog(self, _value=False, dir_path=None, silent=False):
         if not self.may_continue():
@@ -1374,6 +1673,10 @@ class MainWindow(QMainWindow, WindowMixin):
         self.open_next_image()
         for imgPath in self.m_img_list:
             item = QListWidgetItem(imgPath)
+            # set thumbnail icon if available
+            icon = self._thumb_cache.get(imgPath)
+            if icon:
+                item.setIcon(icon)
             self.file_list_widget.addItem(item)
 
     def verify_image(self, _value=False):
@@ -1399,7 +1702,11 @@ class MainWindow(QMainWindow, WindowMixin):
         if self.auto_saving.isChecked():
             if self.default_save_dir is not None:
                 if self.dirty is True:
-                    self.save_file()
+                    try:
+                        self.save_file()
+                    except Exception as e:
+                        self.statusBar().showMessage('Auto-save failed: %s' % ustr(e))
+                        self.statusBar().show()
             else:
                 self.change_save_dir_dialog()
                 return
@@ -1418,13 +1725,24 @@ class MainWindow(QMainWindow, WindowMixin):
             filename = self.m_img_list[self.cur_img_idx]
             if filename:
                 self.load_file(filename)
+                # Preload previous previous (two-steps back) to keep history warm
+                try:
+                    if self.cur_img_idx - 1 >= 0:
+                        prv = self.m_img_list[self.cur_img_idx - 1]
+                        _ = QPixmap(prv)
+                except Exception:
+                    pass
 
     def open_next_image(self, _value=False):
         # Proceeding next image without dialog if having any label
         if self.auto_saving.isChecked():
             if self.default_save_dir is not None:
                 if self.dirty is True:
-                    self.save_file()
+                    try:
+                        self.save_file()
+                    except Exception as e:
+                        self.statusBar().showMessage('Auto-save failed: %s' % ustr(e))
+                        self.statusBar().show()
             else:
                 self.change_save_dir_dialog()
                 return
@@ -1449,6 +1767,15 @@ class MainWindow(QMainWindow, WindowMixin):
 
         if filename:
             self.load_file(filename)
+            # Preload next image pixmap in background cache for snappy switch
+            try:
+                if self.cur_img_idx + 1 < self.img_count:
+                    nxt = self.m_img_list[self.cur_img_idx + 1]
+                    if self._next_image_cache != nxt:
+                        _ = QPixmap(nxt)  # warm filesystem cache
+                        self._next_image_cache = nxt
+            except Exception:
+                pass
 
     def open_file(self, _value=False):
         if not self.may_continue():
@@ -1572,8 +1899,10 @@ class MainWindow(QMainWindow, WindowMixin):
             self.set_dirty()
 
     def delete_selected_shape(self):
-        self.remove_label(self.canvas.delete_selected())
-        self.set_dirty()
+        deleted = self.canvas.delete_selected()
+        if deleted:
+            self.remove_label(deleted)
+            self.set_dirty()
         if self.no_shapes():
             for action in self.actions.onShapesPresent:
                 action.setEnabled(False)
@@ -1636,11 +1965,13 @@ class MainWindow(QMainWindow, WindowMixin):
             return
 
         self.set_format(FORMAT_YOLO)
-        t_yolo_parse_reader = YoloReader(txt_path, self.image)
-        shapes = t_yolo_parse_reader.get_shapes()
-        print(shapes)
-        self.load_labels(shapes)
-        self.canvas.verified = t_yolo_parse_reader.verified
+        try:
+            t_yolo_parse_reader = YoloReader(txt_path, self.image)
+            shapes = t_yolo_parse_reader.get_shapes()
+            self.load_labels(shapes)
+            self.canvas.verified = t_yolo_parse_reader.verified
+        except (FileNotFoundError, ValueError, IOError) as e:
+            self.error_message('YOLO Error', u'<b>%s</b>' % ustr(e))
 
     def load_create_ml_json_by_filename(self, json_path, file_path):
         if self.file_path is None:
@@ -1689,6 +2020,9 @@ def get_main_app(argv=None):
     """
     if not argv:
         argv = []
+    # Enable HiDPI scaling for crisp rendering on 4K/retina
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(argv)
     app.setApplicationName(__appname__)
     app.setWindowIcon(new_icon("app"))
