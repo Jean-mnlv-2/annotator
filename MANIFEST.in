@@ -5,10 +5,15 @@ include README.rst
 
 include resources.qrc
 
+# Données et bibliothèques du projet
 recursive-include data *
-recursive-include icons *
 recursive-include libs *
 
+# Ressources (icônes, chaînes, images)
+recursive-include resources *
+recursive-include readme *.png *.jpg *.svg
+
+# Exclusions
 recursive-exclude build-tools *
 recursive-exclude tests *
 recursive-exclude * __pycache__

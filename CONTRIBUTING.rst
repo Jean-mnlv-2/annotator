@@ -70,6 +70,33 @@ Build/Packaging (optionnel)
 - PyPI: voir ``build-tools/build-for-pypi.sh``.
 - Binaire Windows/macOS/Linux: scripts dans ``build-tools/``. Pour macOS, py2app est supporté via ``setup.py``.
 
+Générer et lancer le .exe (Windows)
+-----------------------------------
+1. Activer le venv et installer les dépendances::
+
+    python -m venv .venv
+    .venv\Scripts\activate
+    python -m pip install --upgrade pip setuptools wheel
+    python -m pip install -r requirements/requirements-windows.txt
+    python -m pip install pyinstaller
+
+2. Générer les ressources Qt (si non générées)::
+
+    if (Test-Path .\.venv\Scripts\pyrcc5.exe) { .\.venv\Scripts\pyrcc5.exe -o libs/resources.py resources.qrc } 
+    else { python -m PyQt5.pyrcc_main -o libs/resources.py resources.qrc }
+
+3. Construire l'exécutable avec PyInstaller (une seule archive)::
+
+    pyinstaller --hidden-import=PyQt5 --hidden-import=lxml -F -n "AKOUMA-Annotator" -c labelImg.py -p ./libs -p ./
+
+4. Lancer l'application générée::
+
+    .\dist\AKOUMA-Annotator.exe [CHEMIN_IMAGES] [FICHIER_CLASSES]
+
+Notes:
+- Si ``pyinstaller`` n'est pas trouvé, relancez après activation du venv.
+- En cas d'absence de ``pyrcc5``, utilisez la commande de secours avec ``python -m PyQt5.pyrcc_main`` ci-dessus.
+
 Ressources utiles
 -----------------
 - Icônes et chaînes sont packagées via ``resources.qrc`` et chargées par ``libs/resources.py``.

@@ -1,3 +1,100 @@
+AKOUMA Annotator (basé sur LabelImg)
+====================================
+
+Outil graphique d'annotation d'images en Python/Qt permettant de créer des boîtes englobantes et d'exporter en formats Pascal VOC, YOLO et CreateML. Ce projet reprend LabelImg et l'adapte avec une configuration prête à l'emploi.
+
+Prérequis
+---------
+
+- Python 3.8+ recommandé
+- Dépendances: ``PyQt5``, ``lxml``
+
+Installation rapide
+-------------------
+
+Linux/macOS
+^^^^^^^^^^^
+
+.. code:: shell
+
+   pip install -r requirements/requirements-linux-python3.txt
+   make qt5
+   python labelImg.py
+
+Windows
+^^^^^^^
+
+.. code:: powershell
+
+   py -m pip install --upgrade pip
+   py -m pip install -r requirements/requirements-windows.txt
+   pyrcc5 -o libs/resources.py resources.qrc
+   py labelImg.py
+
+Lancement
+---------
+
+- Linux/macOS: ``python labelImg.py``
+- Windows: ``py labelImg.py``
+- Optionnel: fournir un chemin d’images et/ou un fichier de classes
+
+.. code:: shell
+
+   python labelImg.py /chemin/vers/images data/predefined_classes.txt
+
+Utilisation
+-----------
+
+1. Fichier > Ouvrir un dossier d'images
+2. Cliquer « Create RectBox » et dessiner vos boîtes
+3. Choisir le format de sortie (PascalVOC/YOLO/CreateML) puis Enregistrer
+
+Raccourcis principaux
+---------------------
+
++--------------------+--------------------------------------------+
+| Ctrl + u           | Charger toutes les images d'un dossier     |
++--------------------+--------------------------------------------+
+| Ctrl + r           | Changer le dossier d'annotations par défaut|
++--------------------+--------------------------------------------+
+| Ctrl + s           | Enregistrer                                |
++--------------------+--------------------------------------------+
+| w                  | Créer une boîte rectangulaire              |
++--------------------+--------------------------------------------+
+| d / a              | Image suivante / précédente                |
++--------------------+--------------------------------------------+
+| Suppr              | Supprimer la boîte sélectionnée            |
++--------------------+--------------------------------------------+
+
+Formats pris en charge
+----------------------
+
+- Pascal VOC: XML par image
+- YOLO: ``.txt`` par image et ``classes.txt``
+- CreateML: JSON compatible CreateML
+
+Définir les classes
+-------------------
+
+Modifiez ``data/predefined_classes.txt`` pour définir vos catégories.
+
+Construction et distribution
+----------------------------
+
+.. code:: shell
+
+   make dist
+
+Licence
+-------
+
+MIT (voir ``LICENSE``)
+
+---
+
+Documentation d'origine LabelImg (EN)
+-------------------------------------
+
 .. image:: /readme/images/labelimg.png
         :target: https://github.com/heartexlabs/label-studio
 

@@ -8,7 +8,7 @@ testpy2:
 	python -m unittest discover tests
 
 testpy3:
-	python3 -m unittest discover tests
+	python -m unittest discover -s tests -p "test_*.py"
 
 qt4: qt4py2
 
@@ -22,6 +22,9 @@ qt4py3:
 
 qt5py3:
 	pyrcc5 -o libs/resources.py resources.qrc
+
+dist:
+	python setup.py sdist bdist_wheel
 
 clean:
 	rm -rf ~/.labelImgSettings.pkl *.pyc dist labelImg.egg-info __pycache__ build

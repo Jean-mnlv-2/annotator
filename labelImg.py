@@ -15,16 +15,11 @@ try:
     from PyQt5.QtGui import *
     from PyQt5.QtCore import *
     from PyQt5.QtWidgets import *
-except ImportError:
-    # needed for py3+qt4
-    # Ref:
-    # http://pyqt.sourceforge.net/Docs/PyQt4/incompatible_apis.html
-    # http://stackoverflow.com/questions/21217399/pyqt4-qtcore-qvariant-object-instead-of-a-string
-    if sys.version_info.major >= 3:
-        import sip
-        sip.setapi('QVariant', 2)
-    from PyQt4.QtGui import *
-    from PyQt4.QtCore import *
+except ImportError as e:
+    raise ImportError(
+        "PyQt5 introuvable. Assurez-vous d'utiliser le bon interpréteur et d'installer: "
+        "pip install pyqt5 pyqt5-sip lxml"
+    ) from e
 
 from libs.combobox import ComboBox
 from libs.default_label_combobox import DefaultLabelComboBox
