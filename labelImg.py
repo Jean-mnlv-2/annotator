@@ -2635,8 +2635,13 @@ def get_main_app(argv=None):
         splash.show()
         app.processEvents()
 
-        # Garde le splash visible pendant 8 secondes
-        QTimer.singleShot(8000, splash.close)
+        # Helper pour afficher une progression réelle par étapes
+        def _progress(msg, pct):
+            try:
+                splash.showMessage(f"{msg} {pct}%", Qt.AlignHCenter | Qt.AlignBottom, Qt.white)
+                app.processEvents()
+            except Exception:
+                pass
     except Exception:
         splash = None
     # Tzutalin 201705+: Accept extra agruments to change predefined class file
@@ -2652,16 +2657,57 @@ def get_main_app(argv=None):
     args.class_file = args.class_file and os.path.normpath(args.class_file)
     args.save_dir = args.save_dir and os.path.normpath(args.save_dir)
 
+    # Mise à jour du splash par étapes (progression réelle)
+    try:
+        _progress("Initialisation Qt...", 10)
+        # Charger paramètres utilisateur
+        try:
+            settings_probe = Settings()
+            settings_probe.load()
+            _progress("Chargement des paramètres...", 30)
+        except Exception:
+            _progress("Chargement des paramètres...", 30)
+
+        # Précharger icône/app
+        try:
+            _ = new_icon("app").pixmap(96, 96)
+            _progress("Chargement des ressources...", 50)
+        except Exception:
+            _progress("Chargement des ressources...", 50)
+
+        # Lecture classes prédéfinies si fichier fourni
+        try:
+            if args.class_file and os.path.exists(args.class_file):
+                with codecs.open(args.class_file, 'r', 'utf8') as f:
+                    _ = [ln.strip() for ln in f if ln.strip()]
+                _progress("Chargement des classes...", 70)
+            else:
+                _progress("Chargement des classes...", 70)
+        except Exception:
+            _progress("Chargement des classes...", 70)
+    except Exception:
+        pass
+
     # Usage : labelImg.py image classFile saveDir
     win = MainWindow(args.image_dir,
                      args.class_file,
                      args.save_dir)
-    win.show()
     try:
-        if splash:
-            splash.finish(win)
+        _progress("Préparation de l'interface...", 90)
+        _progress("Prêt", 100)
     except Exception:
         pass
+
+    def _show_main_window():
+        try:
+            if splash:
+                splash.finish(win)
+        except Exception:
+            pass
+        win.show()
+
+    # Retarde complètement l'apparition de la fenêtre principale jusqu'à la fin du chargement
+    QTimer.singleShot(5000, _show_main_window)
     return app, win
 
 

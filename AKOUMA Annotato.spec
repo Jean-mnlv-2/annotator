@@ -3,7 +3,7 @@
 
 a = Analysis(
     ['labelImg.py'],
-    pathex=['./libs', './'],
+    pathex=['.\\libs', '.\\'],
     binaries=[],
     datas=[('data', 'data')],
     hiddenimports=['pyqt5', 'lxml'],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='labelImg',
+    name='AKOUMA Annotato',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,4 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['resources\\icons\\app.ico'],
 )
