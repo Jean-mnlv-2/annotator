@@ -48,6 +48,9 @@ from libs.hashableQListWidgetItem import HashableQListWidgetItem
 from libs.classManagerDialog import ClassManagerDialog
 from libs.preferences_dialog import PreferencesDialog
 from libs.shortcuts_dialog import ShortcutsDialog
+from libs.export_dialog import ExportDialog
+from libs.start_screen import StartScreen
+from libs.dataset_validator import DatasetValidator, ValidationReportDialog
 
 __appname__ = 'AKOUMA Annotator'
 
@@ -119,6 +122,14 @@ class MainWindow(QMainWindow, WindowMixin):
         self._no_selection_slot = False
         self._beginner = True
         self.screencast = "https://youtu.be/p0nR2YsCY_U"
+
+        # Start Screen (projects)
+        try:
+            from core.project_manager import ProjectManager
+            self.project_manager = ProjectManager()
+            self._maybe_open_start_screen()
+        except Exception:
+            self.project_manager = None
 
         # Load predefined classes to the list
         self.load_predefined_classes(default_prefdef_class_file)
@@ -200,6 +211,9 @@ class MainWindow(QMainWindow, WindowMixin):
         self.file_dock = QDockWidget(get_str('fileList'), self)
         self.file_dock.setObjectName(get_str('files'))
         self.file_dock.setWidget(file_list_container)
+
+        # Cache for thumbnails used by filmstrip
+        self._thumb_cache = {}
 
         self.zoom_widget = ZoomWidget()
         self.light_widget = LightWidget(get_str('lightWidgetTitle'))
@@ -530,12 +544,15 @@ class MainWindow(QMainWindow, WindowMixin):
         self.display_label_option.setChecked(settings.get(SETTING_PAINT_LABEL, False))
         self.display_label_option.triggered.connect(self.toggle_paint_labels_option)
 
+        # Nouveau flux d'export unifié
+        export_unified = action('Exporter…', self.open_export_dialog, None, 'save', 'Exporter les annotations (COCO/YOLO/VOC)')
+
         add_actions(self.menus.file,
-                    (open, open_dir, change_save_dir, batch_rename, manage_classes, export_shortcuts, import_shortcuts, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
+                    (open, open_dir, change_save_dir, batch_rename, manage_classes, export_shortcuts, import_shortcuts, export_unified, open_annotation, copy_prev_bounding, self.menus.recentFiles, save, save_format, save_as, close, reset_all, delete_image, quit))
         add_actions(self.menus.help, (help_default, show_info, show_shortcut))
         # Language submenu (FR/EN)
         self.language_menu = QMenu('Language', self)
-        self._current_locale = settings.get(SETTING_LOCALE, None)
+        _current_locale = settings.get(SETTING_LOCALE, None)
         def _switch_lang(locale_code):
             self._current_locale = locale_code
             QMessageBox.information(self, 'Language', 'La langue sera appliquée au redémarrage.')
@@ -575,7 +592,26 @@ class MainWindow(QMainWindow, WindowMixin):
         except Exception:
             pass
 
+        # Grid/Snapping toggles
+        try:
+            self.grid_toggle = action('Afficher la grille', self.toggle_grid, None, 'help', 'Afficher/masquer la grille')
+            self.grid_toggle.setCheckable(True)
+            self.snap_toggle = action('Activer le snapping', self.toggle_snap, None, 'help', 'Activer le snapping sur la grille')
+            self.snap_toggle.setCheckable(True)
+            add_actions(self.menus.view, (self.grid_toggle, self.snap_toggle,))
+        except Exception:
+            pass
+
         self.menus.file.aboutToShow.connect(self.update_file_menu)
+
+        # Project menu
+        try:
+            open_project_act = action('Ouvrir projet…', self.open_project_dialog, None, 'open', 'Ouvrir un projet')
+            new_project_act = action('Nouveau projet…', self.new_project_dialog, None, 'save', 'Créer un projet')
+            validate_ds_act = action('Valider dataset…', self.validate_dataset, None, 'help', 'Valider la cohérence du dataset')
+            add_actions(self.menus.file, (open_project_act, new_project_act, validate_ds_act))
+        except Exception:
+            pass
 
         # Custom context menu for the canvas widget:
         add_actions(self.canvas.menus[0], self.actions.beginnerContext)
@@ -603,6 +639,46 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             pass
         self.shortcuts_dock.setWidget(shortcuts_text)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.shortcuts_dock)
+
+        # Filmstrip / Miniatures dock
+        try:
+            self.filmstrip = QListWidget(self)
+            self.filmstrip.setViewMode(QListWidget.IconMode)
+            self.filmstrip.setIconSize(QSize(96, 96))
+            self.filmstrip.setResizeMode(QListWidget.Adjust)
+            self.filmstrip.setMovement(QListWidget.Static)
+            self.filmstrip.setSpacing(4)
+            self.filmstrip_dock = QDockWidget('Miniatures', self)
+            self.filmstrip_dock.setWidget(self.filmstrip)
+            self.addDockWidget(Qt.BottomDockWidgetArea, self.filmstrip_dock)
+            self.filmstrip.itemClicked.connect(self._on_filmstrip_clicked)
+        except Exception:
+            pass
+
+        # Modern toolbar: context-sensitive
+        try:
+            self.tools.setIconSize(QSize(20, 20))
+            self.tools.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        except Exception:
+            pass
+
+        # --- Autosave & Recovery ---
+        self._autosave_timer = QTimer(self)
+        try:
+            interval_s = int(self.settings.get(SETTING_AUTO_SAVE, True) and 300 or 0)
+        except Exception:
+            interval_s = 300
+        self._autosave_timer.setInterval(max(10, interval_s) * 1000)
+        self._autosave_timer.timeout.connect(self._autosave_tick)
+        if self.settings.get(SETTING_AUTO_SAVE, True):
+            self._autosave_timer.start()
+
+        # Simple image cache for preloading neighbors
+        self._image_cache = {}
+        self._preload_enabled = True
+
+        # Check for crash recovery backups
+        QTimer.singleShot(100, self._check_recovery_backup)
         # Style the left shortcuts dock with a green theme
         try:
             self.shortcuts_dock.setObjectName('ShortcutsDock')
@@ -1000,6 +1076,8 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
                 icon, '&%d %s' % (i + 1, QFileInfo(f).fileName()), self)
             action.triggered.connect(partial(self.load_recent, f))
             menu.addAction(action)
+        # Rebuild filmstrip thumbnails when menu updates (safe hook)
+        self._rebuild_filmstrip()
 
     def pop_label_list_menu(self, point):
         self.menus.labelList.exec_(self.label_list.mapToGlobal(point))
@@ -1477,7 +1555,11 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
                 self.label_file = None
                 self.canvas.verified = False
 
-            if isinstance(self.image_data, QImage):
+            # Prefer cached/preloaded image if available
+            cached = self._image_cache.get(unicode_file_path)
+            if isinstance(cached, QImage) and not cached.isNull():
+                image = cached
+            elif isinstance(self.image_data, QImage):
                 image = self.image_data
             else:
                 image = QImage.fromData(self.image_data)
@@ -1499,6 +1581,9 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
             self.add_recent_file(self.file_path)
             self.toggle_actions(True)
             self.show_bounding_box_from_annotation_file(self.file_path)
+
+            # Preload neighbors for faster navigation
+            self._preload_neighbors()
 
             counter = self.counter_str()
             self.setWindowTitle(__appname__ + ' ' + file_path + ' ' + counter)
@@ -1707,6 +1792,246 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
                 w.setPlainText("\n".join(lines))
         except Exception:
             pass
+
+    # --- Start Screen / Project actions ---
+    def _maybe_open_start_screen(self):
+        try:
+            recent = getattr(self.project_manager, 'recent_projects', []) if self.project_manager else []
+            dlg = StartScreen(self, recent_projects=recent)
+            if dlg.exec_() == QDialog.Accepted:
+                if dlg.new_project_params:
+                    name, path, images = dlg.new_project_params
+                    if self.project_manager:
+                        if self.project_manager.create_project(path, name, images):
+                            return
+                sel = dlg.get_selected_recent()
+                if sel and self.project_manager:
+                    self.project_manager.open_project(sel)
+        except Exception:
+            pass
+
+    def open_project_dialog(self):
+        try:
+            d = QFileDialog.getExistingDirectory(self, 'Ouvrir un projet')
+            if d and self.project_manager:
+                self.project_manager.open_project(d)
+        except Exception:
+            pass
+
+    def new_project_dialog(self):
+        try:
+            self._maybe_open_start_screen()
+        except Exception:
+            pass
+
+    # --- Dataset validation ---
+    def validate_dataset(self):
+        try:
+            classes = list(self.label_hist)
+            validator = DatasetValidator(classes)
+            report = validator.validate(self.m_img_list or [])
+            dlg = ValidationReportDialog(self, report)
+            dlg.exec_()
+        except Exception as e:
+            self.error_message('Validation', ustr(e))
+
+    # --- Filmstrip handlers ---
+    def _on_filmstrip_clicked(self, item):
+        try:
+            path = item.data(Qt.UserRole)
+            if path:
+                self.load_file(path)
+        except Exception:
+            pass
+
+    # --- Autosave implementation ---
+    def _backup_path(self) -> str:
+        try:
+            import os
+            if self.file_path:
+                base, _ = os.path.splitext(self.file_path)
+                return base + ".annot.bak.json"
+        except Exception:
+            pass
+        return ""
+
+    def _autosave_tick(self):
+        try:
+            if not self.dirty or not self.file_path:
+                return
+            backup = self._backup_path()
+            if not backup:
+                return
+            # Use COCO JSON as robust backup container
+            shapes = self.canvas.shapes
+            self.label_file.save_coco_format(backup, shapes, self.file_path, self.image_data,
+                                             self.label_hist, self.line_color.getRgb(), self.fill_color.getRgb())
+        except Exception:
+            pass
+
+    def _check_recovery_backup(self):
+        try:
+            backup = self._backup_path()
+            if not backup:
+                return
+            import os
+            if os.path.exists(backup):
+                ret = QMessageBox.question(self, 'Récupération',
+                                           'Un fichier de récupération a été trouvé. Voulez-vous le charger ?')
+                if ret == QMessageBox.Yes:
+                    self.load_coco_json_by_filename(backup)
+        except Exception:
+            pass
+
+    # --- Preloading neighbors ---
+    def _preload_neighbors(self):
+        if not self._preload_enabled or not self.m_img_list:
+            return
+        try:
+            paths = []
+            if 0 <= self.cur_img_idx + 1 < len(self.m_img_list):
+                paths.append(self.m_img_list[self.cur_img_idx + 1])
+            if 0 <= self.cur_img_idx - 1 < len(self.m_img_list):
+                paths.append(self.m_img_list[self.cur_img_idx - 1])
+            for p in paths:
+                if p in self._image_cache:
+                    continue
+                img = QImage(p)
+                if not img.isNull():
+                    self._image_cache[p] = img
+        except Exception:
+            pass
+
+    # --- Export unifié ---
+    def open_export_dialog(self):
+        try:
+            dlg = ExportDialog(self, current_image_path=self.file_path)
+        except Exception as e:
+            self.error_message('Export', ustr(e))
+            return
+
+        # Générer un aperçu sommaire selon le format
+        try:
+            fmt = (dlg.format_combo.currentText() or '').lower()
+            preview = ''
+            if fmt == 'coco':
+                preview = self._build_coco_preview()
+            elif fmt == 'yolo':
+                preview = self._build_yolo_preview()
+            else:
+                preview = self._build_voc_preview()
+            dlg.set_preview_text(preview)
+        except Exception as e:
+            dlg.set_preview_text('Preview error: ' + ustr(e))
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        fmt, path = dlg.get_selection()
+        if not path:
+            self.error_message('Export', 'Chemin de sortie manquant.')
+            return
+
+        try:
+            if fmt == 'COCO':
+                ok = self._export_current_as_coco(path)
+            elif fmt == 'YOLO':
+                ok = self._export_current_as_yolo(path)
+            else:
+                ok = self._export_current_as_voc(path)
+            if not ok:
+                self.error_message('Export', 'Export échoué. Voir la console ou les messages.')
+        except Exception as e:
+            self.error_message('Export', ustr(e))
+
+    def _export_current_as_voc(self, out_path: str) -> bool:
+        if not self.label_file or not self.file_path:
+            return False
+        try:
+            shapes = [s.shape for s in self.items_to_shapes.values()]
+        except Exception:
+            shapes = self.canvas.shapes
+        try:
+            self.set_format(FORMAT_PASCALVOC)
+            p = out_path
+            if not p.lower().endswith('.xml'):
+                p += XML_EXT
+            self.label_file.save_pascal_voc_format(p, shapes, self.file_path, self.image_data,
+                                                   self.line_color.getRgb(), self.fill_color.getRgb())
+            return True
+        except Exception:
+            return False
+
+    def _export_current_as_yolo(self, out_dir_or_file: str) -> bool:
+        if not self.label_file or not self.file_path:
+            return False
+        try:
+            shapes = [s.shape for s in self.items_to_shapes.values()]
+        except Exception:
+            shapes = self.canvas.shapes
+        try:
+            import os
+            self.set_format(FORMAT_YOLO)
+            if os.path.isdir(out_dir_or_file):
+                base = os.path.splitext(os.path.basename(self.file_path))[0]
+                out_path = os.path.join(out_dir_or_file, base + TXT_EXT)
+            else:
+                out_path = out_dir_or_file if out_dir_or_file.lower().endswith('.txt') else out_dir_or_file + TXT_EXT
+            self.label_file.save_yolo_format(out_path, shapes, self.file_path, self.image_data, self.label_hist,
+                                             self.line_color.getRgb(), self.fill_color.getRgb())
+            return True
+        except Exception:
+            return False
+
+    def _export_current_as_coco(self, out_path: str) -> bool:
+        if not self.label_file or not self.file_path:
+            return False
+        try:
+            shapes = [s.shape for s in self.items_to_shapes.values()]
+        except Exception:
+            shapes = self.canvas.shapes
+        try:
+            self.set_format(FORMAT_COCO)
+            p = out_path
+            if not p.lower().endswith('.json'):
+                p += JSON_EXT
+            self.label_file.save_coco_format(p, shapes, self.file_path, self.image_data,
+                                             self.label_hist, self.line_color.getRgb(), self.fill_color.getRgb())
+            return True
+        except Exception:
+            return False
+
+    def _build_voc_preview(self) -> str:
+        try:
+            from xml.etree.ElementTree import Element, SubElement, tostring
+            top = Element('annotation')
+            SubElement(top, 'folder').text = 'images'
+            SubElement(top, 'filename').text = os.path.basename(self.file_path or '')
+            return tostring(top, encoding='unicode')
+        except Exception:
+            return ''
+
+    def _build_yolo_preview(self) -> str:
+        try:
+            lines = []
+            for s in self.canvas.shapes:
+                lines.append('# class_id cx cy w h  (aperçu)')
+                break
+            return '\n'.join(lines)
+        except Exception:
+            return ''
+
+    def _build_coco_preview(self) -> str:
+        try:
+            import json, os
+            data = {
+                'images': [{'id': 1, 'file_name': os.path.basename(self.file_path or ''), 'width': getattr(self.image, 'width', lambda: 0)(), 'height': getattr(self.image, 'height', lambda: 0)()}],
+                'categories': [],
+                'annotations': []
+            }
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        except Exception:
+            return ''
         self.update_annotation_preview()
 
     def toggle_command_palette(self):
@@ -2646,6 +2971,80 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
         loader.finished.connect(_apply)
         loader.start()
         return True
+
+    def _rebuild_filmstrip(self):
+        try:
+            if not hasattr(self, 'filmstrip') or self.filmstrip is None:
+                return
+            self.filmstrip.clear()
+            for p in self.m_img_list:
+                item = QListWidgetItem()
+                item.setText(os.path.basename(p))
+                # Thumbnail cache
+                pm = self._thumb_cache.get(p)
+                if pm is None:
+                    try:
+                        qpm = QPixmap(p)
+                        if not qpm.isNull():
+                            pm = qpm.scaled(96, 96, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                            self._thumb_cache[p] = pm
+                    except Exception:
+                        pm = None
+                if pm:
+                    item.setIcon(pm)
+                item.setData(Qt.UserRole, p)
+                self.filmstrip.addItem(item)
+        except Exception:
+            pass
+
+    # --- Grid / Snap ---
+    def toggle_grid(self):
+        try:
+            self.canvas.grid_enabled = not getattr(self.canvas, 'grid_enabled', False)
+            self.canvas.update()
+        except Exception:
+            pass
+
+    def toggle_snap(self):
+        try:
+            self.canvas.snap_enabled = not getattr(self.canvas, 'snap_enabled', False)
+            self.canvas.update()
+        except Exception:
+            pass
+
+    # --- ONNX pre-annotation (opt-in) ---
+    def run_preannotation(self):
+        try:
+            import importlib
+            ort = importlib.import_module('onnxruntime')
+        except Exception:
+            self.error_message('Pré-annotation', 'onnxruntime non installé. Installez-le pour activer la pré-annotation.')
+            return
+        try:
+            # Placeholder pipeline: show info only
+            QMessageBox.information(self, 'Pré-annotation', 'Pré-annotation ONNX est prête (démo).')
+        except Exception as e:
+            self.error_message('Pré-annotation', ustr(e))
+
+    # --- Crash reporter ---
+    def _install_crash_reporter(self):
+        import sys, traceback, os
+        def handler(exc_type, exc_value, exc_tb):
+            try:
+                log_dir = os.path.join(os.path.expanduser('~'), 'AKOUMA_Annotator_Logs')
+                os.makedirs(log_dir, exist_ok=True)
+                path = os.path.join(log_dir, 'crash.log')
+                with open(path, 'a', encoding='utf-8') as f:
+                    f.write('\n=== Crash ===\n')
+                    traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+            except Exception:
+                pass
+            # show user-friendly message
+            try:
+                QMessageBox.critical(self, 'Crash', 'Une erreur critique est survenue. Un journal a été enregistré.')
+            except Exception:
+                pass
+        sys.excepthook = handler
 
 def inverted(color):
     return QColor(*[255 - v for v in color.getRgb()])

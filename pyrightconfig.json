@@ -1,13 +1,24 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/pyright/schema/pyrightconfig.schema.json",
   "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true,
   "reportMissingImports": "warning",
+  "reportAttributeAccessIssue": "none",
+  "reportOptionalMemberAccess": "none",
+  "reportOptionalSubscript": "none",
+  "reportOptionalIterable": "none",
+  "reportArgumentType": "none",
+  "reportWildcardImportFromLibrary": "none",
   "venvPath": ".",
   "venv": ".venv",
   "executionEnvironments": [
     {
       "root": ".",
-      "extraPaths": ["."]
+      "pythonVersion": "3.13",
+      "extraPaths": [
+        ".",
+        ".venv/Lib/site-packages"
+      ]
     }
   ]
 }

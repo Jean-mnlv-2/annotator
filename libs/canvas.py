@@ -65,6 +65,9 @@ class Canvas(QWidget):
         self.setFocusPolicy(Qt.WheelFocus)
         self.verified = False
         self.draw_square = False
+        self.grid_enabled = False
+        self.grid_size = 32
+        self.snap_enabled = False
 
         # initialisation for panning
         self.pan_initial_pos = QPoint()
@@ -514,6 +517,19 @@ class Canvas(QWidget):
             painter.end()
 
         p.drawPixmap(0, 0, temp)
+
+        # Grid
+        if self.grid_enabled and self.grid_size > 4:
+            pen = QPen(QColor(0, 0, 0, 40))
+            pen.setStyle(Qt.DotLine)
+            p.setPen(pen)
+            w, h = self.pixmap.width(), self.pixmap.height()
+            step = int(self.grid_size)
+            for x in range(0, w, step):
+                p.drawLine(x, 0, x, h)
+            for y in range(0, h, step):
+                p.drawLine(0, y, w, y)
+
         Shape.scale = self.scale
         Shape.label_font_size = self.label_font_size
         for shape in self.shapes:
