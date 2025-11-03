@@ -46,6 +46,8 @@ from libs.coco_io import CocoReader
 from libs.ustr import ustr
 from libs.hashableQListWidgetItem import HashableQListWidgetItem
 from libs.classManagerDialog import ClassManagerDialog
+from libs.preferences_dialog import PreferencesDialog
+from libs.shortcuts_dialog import ShortcutsDialog
 
 __appname__ = 'AKOUMA Annotator'
 
@@ -565,6 +567,14 @@ class MainWindow(QMainWindow, WindowMixin):
         toggle_palette = action('Command Palette', self.toggle_command_palette, 'Ctrl+P', 'help', 'Open command palette')
         add_actions(self.menus.help, (toggle_palette,))
 
+        # Preferences & Shortcuts editor entries
+        try:
+            prefs_act = action('Préférences…', self.open_preferences_dialog, 'Ctrl+,', 'settings', 'Ouvrir les préférences')
+            shortcuts_editor_act = action('Éditeur de raccourcis…', self.open_shortcuts_editor, None, 'help', 'Modifier les raccourcis')
+            add_actions(self.menus.edit, (prefs_act, shortcuts_editor_act,))
+        except Exception:
+            pass
+
         self.menus.file.aboutToShow.connect(self.update_file_menu)
 
         # Custom context menu for the canvas widget:
@@ -580,6 +590,17 @@ class MainWindow(QMainWindow, WindowMixin):
 Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW       Create Rect\nA/D     Prev/Next Image\nDel     Delete Box\nSpace   Verify Image\nCtrl++  Zoom In\nCtrl+-  Zoom Out
 ''')
         self.shortcuts_dock = QDockWidget('Shortcuts', self)
+        try:
+            # Remplir dynamiquement depuis ShortcutManager si disponible
+            from libs.shortcut_manager import get_shortcut_manager
+            sm = get_shortcut_manager()
+            lines = []
+            for act in sm.get_all_actions():
+                if getattr(act, 'enabled', True):
+                    lines.append(f"{act.current_key or act.default_key:8s}  {act.name}")
+            shortcuts_text.setPlainText("\n".join(lines) if lines else shortcuts_text.toPlainText())
+        except Exception:
+            pass
         self.shortcuts_dock.setWidget(shortcuts_text)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.shortcuts_dock)
         # Style the left shortcuts dock with a green theme
@@ -1636,6 +1657,56 @@ Ctrl+O  Open File\nCtrl+U  Open Dir\nCtrl+R  Change Save Dir\nCtrl+S  Save\nW   
 
     def on_shape_moved(self):
         self.set_dirty()
+
+    # --- Preferences / Shortcuts dialogs ---
+    def open_preferences_dialog(self):
+        try:
+            # Provide optional managers if available
+            config_manager = None
+            try:
+                from core.config_manager import ConfigManager
+                config_manager = ConfigManager()
+                config_manager.load_config()
+            except Exception:
+                config_manager = None
+            shortcut_manager = None
+            try:
+                from libs.shortcut_manager import get_shortcut_manager
+                shortcut_manager = get_shortcut_manager()
+                # Attach to main window to ensure QShortcut parent
+                shortcut_manager.parent_widget = self
+            except Exception:
+                shortcut_manager = None
+            dlg = PreferencesDialog(self, config_manager=config_manager, shortcut_manager=shortcut_manager)
+            dlg.exec_()
+        except Exception as e:
+            self.error_message('Préférences', ustr(e))
+
+    def open_shortcuts_editor(self):
+        try:
+            from libs.shortcut_manager import get_shortcut_manager
+            sm = get_shortcut_manager()
+            sm.parent_widget = self
+            dlg = ShortcutsDialog(self, shortcut_manager=sm)
+            if dlg.exec_():
+                # Refresh cheatsheet
+                self._refresh_shortcuts_cheatsheet()
+        except Exception as e:
+            self.error_message('Raccourcis', ustr(e))
+
+    def _refresh_shortcuts_cheatsheet(self):
+        try:
+            from libs.shortcut_manager import get_shortcut_manager
+            sm = get_shortcut_manager()
+            lines = []
+            for act in sm.get_all_actions():
+                if getattr(act, 'enabled', True):
+                    key = act.current_key or act.default_key or ''
+                    lines.append(f"{key:8s}  {act.name}")
+            for w in self.shortcuts_dock.findChildren(QPlainTextEdit):
+                w.setPlainText("\n".join(lines))
+        except Exception:
+            pass
         self.update_annotation_preview()
 
     def toggle_command_palette(self):

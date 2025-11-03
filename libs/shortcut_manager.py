@@ -7,12 +7,11 @@ from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
 try:
-    from PyQt5.QtGui import QKeySequence, QShortcut
+    from PyQt5.QtGui import QKeySequence
     from PyQt5.QtCore import QObject, pyqtSignal, QSettings, QTimer
-    from PyQt5.QtWidgets import QWidget, QApplication
-except ImportError:
-    from PyQt4.QtGui import QKeySequence, QShortcut, QWidget, QApplication
-    from PyQt4.QtCore import QObject, pyqtSignal, QSettings, QTimer
+    from PyQt5.QtWidgets import QWidget, QApplication, QShortcut
+except ImportError as e:
+    raise e
 
 
 class ShortcutCategory(Enum):
